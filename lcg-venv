@@ -1,0 +1,113 @@
+#!/bin/bash -e
+#
+# lcg-venv: create a Python virtual environment on top of an LCG view that
+# behaves like a "real" venv -- packages you install locally take precedence
+# over the ones shipped in the LCG view, while LCG-only packages (ROOT,
+# Geant4, ...) stay importable.
+#
+# This is the LCG analogue of CMSSW's scram-venv. The difference from
+# matthewfeickert/cvmfs-venv is *where* the PYTHONPATH problem is fixed:
+# instead of rewriting bin/activate to reshuffle $PYTHONPATH in the shell,
+# we fix sys.path *inside the interpreter* with a .pth import hook (the same
+# idea CMSSW uses with sitecustomize.py). Consequences:
+#
+#   * Works no matter how python is launched -- `activate`, direct call to
+#     <venv>/bin/python, a shebang script, a subprocess, Jupyter, etc.
+#   * No editing of the generated activate script; nothing to keep in sync
+#     with future CPython venv templates.
+#   * The script is only needed once, at creation time.
+#
+# Usage:
+#   source /cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/setup.sh
+#   lcg-venv [venv-name]          # default name: venv
+#   . venv/bin/activate
+#
+# Requires: an LCG view (or any environment that puts CVMFS packages on
+# PYTHONPATH) already set up, with python3 >= 3.3 on PATH.
+
+VENV_NAME="${1:-venv}"
+
+# --- sanity checks ----------------------------------------------------------
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "lcg-venv: no python3 on PATH; set up an LCG view first" >&2
+  exit 1
+fi
+
+PYTHON="$(command -v python3)"
+case "$PYTHON" in
+  /cvmfs/*) : ;;  # good, this is the LCG/CVMFS python
+  *) echo "lcg-venv: warning: python3 ($PYTHON) is not under /cvmfs;" \
+          "is an LCG view set up?" >&2 ;;
+esac
+
+if [ -e "$VENV_NAME" ]; then
+  echo "lcg-venv: '$VENV_NAME' already exists; remove it or pick another name" >&2
+  exit 1
+fi
+
+# --- create the venv --------------------------------------------------------
+# --system-site-packages is required so the LCG view's packages remain
+# visible; the .pth hook below is what makes local installs win regardless.
+echo "lcg-venv: creating virtual environment '$VENV_NAME'"
+"$PYTHON" -m venv --system-site-packages "$VENV_NAME"
+
+# Resolve the venv's site-packages directory (purelib) from the venv python
+# itself, so we don't have to guess the python X.Y directory name.
+SITE_DIR="$("$VENV_NAME/bin/python" - <<'PY'
+import sysconfig
+print(sysconfig.get_path("purelib"))
+PY
+)"
+
+if [ -z "$SITE_DIR" ] || [ ! -d "$SITE_DIR" ]; then
+  echo "lcg-venv: could not locate venv site-packages" >&2
+  exit 1
+fi
+
+# --- install the sys.path fix ----------------------------------------------
+# The module reorders sys.path at startup so this venv's site dirs come ahead
+# of the LCG view directories that PYTHONPATH injected.
+cat > "$SITE_DIR/_lcgvenv_pathfix.py" <<'PY'
+"""Give this venv's site-packages precedence over LCG view packages.
+
+An LCG view's setup.sh injects the view directories via PYTHONPATH, and the
+interpreter places PYTHONPATH entries on sys.path *ahead* of a venv's own
+site-packages. That shadows anything installed into the venv. This module
+runs at interpreter startup (imported from a .pth file, after site has built
+sys.path) and moves this venv's site directories back to the front, while
+leaving every LCG entry in place so LCG-only packages stay importable.
+"""
+import sys
+import sysconfig
+
+
+def _venv_site_dirs():
+    dirs = []
+    for key in ("purelib", "platlib"):
+        try:
+            p = sysconfig.get_path(key)
+        except Exception:
+            continue
+        if p and p not in dirs:
+            dirs.append(p)
+    return dirs
+
+
+def _fix():
+    # Only act inside a venv (sys.prefix != sys.base_prefix).
+    if getattr(sys, "prefix", None) == getattr(sys, "base_prefix", None):
+        return
+    venv_dirs = [d for d in _venv_site_dirs() if d in sys.path]
+    if not venv_dirs:
+        return
+    remaining = [p for p in sys.path if p not in venv_dirs]
+    sys.path[:] = venv_dirs + remaining
+
+
+_fix()
+PY
+
+# The .pth import line is executed by the site module during startup.
+echo "import _lcgvenv_pathfix" > "$SITE_DIR/_lcgvenv_pathfix.pth"
+
+echo "lcg-venv: done. Activate with:  . $VENV_NAME/bin/activate"
