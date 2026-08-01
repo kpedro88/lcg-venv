@@ -34,6 +34,25 @@ The `site` module executes the `.pth` line at **every** interpreter startup,
 *after* `sys.path` has been built from `PYTHONPATH` — so it always gets the last
 word, no matter how Python was launched.
 
+### `PYTHONHOME` and embedded interpreters (e.g. `gdb`)
+
+Programs that **embed their own libpython** — most notably the LCG `gdb` — do
+not read `pyvenv.cfg` or `.pth` files. They locate the stdlib from the
+build-time prefix compiled into the binary, and for LCG that path
+(`/build/jenkins/.../Python/3.11.9/...`) does not exist on cvmfs. LCG's
+`setup.sh` papers over this by exporting `PYTHONHOME`, which points the
+embedded interpreter at the real cvmfs stdlib.
+
+Stock venv `activate` **unsets `PYTHONHOME`**. With it gone, `gdb`'s embedded
+Python can't find `encodings` and dies at startup.
+
+`lcg-venv` therefore appends a small restore step to the end of `bin/activate`
+(and `bin/activate.fish`) that puts `PYTHONHOME` back after venv activation. It
+points at the venv's own base interpreter, so it is safe for the venv python
+(which still reports the venv `sys.prefix` and still lets local packages win),
+and `deactivate` restores/round-trips it cleanly. `activate.csh` never touches
+`PYTHONHOME`, so it needs no change.
+
 ## Caveats
 
 * **`PATH` name resolution.** If you re-source the LCG view *after* activating,

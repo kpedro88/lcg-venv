@@ -13,9 +13,20 @@
 #
 #   * Works no matter how python is launched -- `activate`, direct call to
 #     <venv>/bin/python, a shebang script, a subprocess, Jupyter, etc.
-#   * No editing of the generated activate script; nothing to keep in sync
-#     with future CPython venv templates.
+#   * The .pth hook is the whole sys.path story; nothing line-numbered is
+#     injected into the activate template.
 #   * The script is only needed once, at creation time.
+#
+# There is ONE thing that must be fixed at the shell level: PYTHONHOME.
+# LCG's setup.sh sets PYTHONHOME so that programs embedding their own
+# libpython (notably the LCG `gdb`, whose build-time stdlib path no longer
+# exists) can locate the stdlib. Stock venv `activate` *unsets* PYTHONHOME,
+# which makes those embedded interpreters fail with
+# "ModuleNotFoundError: No module named 'encodings'". A .pth/sitecustomize
+# hook cannot help here -- the embedded interpreter crashes before it can
+# read any .pth file -- so PYTHONHOME must be present in the environment.
+# We therefore re-set PYTHONHOME at the end of activation. It points at this
+# venv's own base interpreter, so keeping it set is safe for the venv python.
 #
 # Usage:
 #   source /cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/setup.sh
@@ -109,5 +120,37 @@ PY
 
 # The .pth import line is executed by the site module during startup.
 echo "import _lcgvenv_pathfix" > "$SITE_DIR/_lcgvenv_pathfix.pth"
+
+# --- keep PYTHONHOME set for embedded interpreters (e.g. gdb) ---------------
+# Append a restore step to the end of the activation scripts that unset
+# PYTHONHOME. Stock venv stashes the old value in _OLD_VIRTUAL_PYTHONHOME
+# before unsetting it, so we just put it back. deactivate() still restores and
+# unsets _OLD_VIRTUAL_PYTHONHOME as usual, so the round-trip stays clean.
+# csh's activate.csh does not touch PYTHONHOME, so it needs no change.
+BIN_DIR="$VENV_NAME/bin"
+
+if [ -f "$BIN_DIR/activate" ]; then
+  cat >> "$BIN_DIR/activate" <<'EOF'
+
+# Added by lcg-venv: keep PYTHONHOME set so programs that embed their own
+# libpython (e.g. the LCG gdb) can still find the stdlib. It points at this
+# venv's base interpreter, so it is safe for the venv python too.
+if [ -n "${_OLD_VIRTUAL_PYTHONHOME:-}" ] ; then
+    PYTHONHOME="${_OLD_VIRTUAL_PYTHONHOME}"
+    export PYTHONHOME
+fi
+EOF
+fi
+
+if [ -f "$BIN_DIR/activate.fish" ]; then
+  cat >> "$BIN_DIR/activate.fish" <<'EOF'
+
+# Added by lcg-venv: keep PYTHONHOME set so programs that embed their own
+# libpython (e.g. the LCG gdb) can still find the stdlib.
+if set -q _OLD_VIRTUAL_PYTHONHOME
+    set -gx PYTHONHOME $_OLD_VIRTUAL_PYTHONHOME
+end
+EOF
+fi
 
 echo "lcg-venv: done. Activate with:  . $VENV_NAME/bin/activate"
