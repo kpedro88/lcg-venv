@@ -76,17 +76,33 @@ if [ -z "$SITE_DIR" ] || [ ! -d "$SITE_DIR" ]; then
 fi
 
 # --- install the sys.path fix ----------------------------------------------
-# The module reorders sys.path at startup so this venv's site dirs come ahead
-# of the LCG view directories that PYTHONPATH injected.
-cat > "$SITE_DIR/_lcgvenv_pathfix.py" <<'PY'
-"""Give this venv's site-packages precedence over LCG view packages.
+# The fix has two cooperating pieces, needed because of *when* Python's `site`
+# module runs each kind of hook at startup:
+#
+#   1. _lcgvenv_pathfix.pth  -> imports _lcgvenv_pathfix, which PROMOTES this
+#      venv's site-packages to the front of sys.path. .pth files are processed
+#      early, so this ensures our own sitecustomize.py (below) is the one that
+#      gets imported, instead of the LCG view's shadowing it.
+#
+#   2. sitecustomize.py      -> DEMOTES every directory the LCG view injected
+#      via PYTHONPATH to the tail of sys.path. site.main() runs sitecustomize
+#      *after all* .pth files, so this reliably wins even against paths that
+#      .pth files append later -- most importantly `pip install -e` (editable
+#      installs), which drop a .pth that appends the project source dir. A
+#      .pth-only fix cannot catch those, because .pth files run in sorted order
+#      and an editable .pth may sort after ours. sitecustomize always runs last.
+#
+# Because `site` imports only the first sitecustomize.py found on sys.path,
+# ours also chains to the next one (e.g. the LCG view's) so its behaviour is
+# preserved.
 
-An LCG view's setup.sh injects the view directories via PYTHONPATH, and the
-interpreter places PYTHONPATH entries on sys.path *ahead* of a venv's own
-site-packages. That shadows anything installed into the venv. This module
-runs at interpreter startup (imported from a .pth file, after site has built
-sys.path) and moves this venv's site directories back to the front, while
-leaving every LCG entry in place so LCG-only packages stay importable.
+# Piece 1: the .pth promoter.
+cat > "$SITE_DIR/_lcgvenv_pathfix.py" <<'PY'
+"""Promote this venv's site-packages to the front of sys.path.
+
+Runs early (imported from a .pth file) so that the venv's own sitecustomize.py
+is discovered by `site` ahead of the LCG view's. The authoritative reordering
+happens later in sitecustomize.py.
 """
 import sys
 import sysconfig
@@ -104,7 +120,7 @@ def _venv_site_dirs():
     return dirs
 
 
-def _fix():
+def _promote():
     # Only act inside a venv (sys.prefix != sys.base_prefix).
     if getattr(sys, "prefix", None) == getattr(sys, "base_prefix", None):
         return
@@ -115,11 +131,87 @@ def _fix():
     sys.path[:] = venv_dirs + remaining
 
 
-_fix()
+_promote()
 PY
 
 # The .pth import line is executed by the site module during startup.
 echo "import _lcgvenv_pathfix" > "$SITE_DIR/_lcgvenv_pathfix.pth"
+
+# Piece 2: the sitecustomize demoter (+ chain to any next sitecustomize).
+cat > "$SITE_DIR/sitecustomize.py" <<'PY'
+"""lcg-venv: make this venv's packages win over the LCG view's.
+
+Runs from the `site` module at interpreter startup, *after* every .pth file
+has been processed (site.main() calls execsitecustomize() last). That timing
+is essential: editable installs (`pip install -e`) drop a .pth that appends
+their source dir to sys.path, and .pth files run in sorted order, so a .pth
+hook cannot reliably reorder around them. A sitecustomize always runs last.
+
+Strategy: move every directory that the LCG view injected via PYTHONPATH to
+the *tail* of sys.path. Whatever remains ahead -- the venv site-packages and
+any editable/source dirs added by .pth files -- keeps priority, while all LCG
+packages stay importable from the tail.
+"""
+import os
+import os.path as _osp
+import sys
+
+
+def _demote_lcg_paths():
+    # Only act inside a venv.
+    if getattr(sys, "prefix", None) == getattr(sys, "base_prefix", None):
+        return
+    pythonpath = os.environ.get("PYTHONPATH", "")
+    if not pythonpath:
+        return
+    lcg = set()
+    for d in pythonpath.split(os.pathsep):
+        if not d:
+            continue
+        try:
+            lcg.add(_osp.realpath(d))
+        except Exception:
+            pass
+    if not lcg:
+        return
+    keep, tail = [], []
+    for p in sys.path:
+        try:
+            rp = _osp.realpath(p)
+        except Exception:
+            rp = p
+        (tail if rp in lcg else keep).append(p)
+    if tail:  # preserve relative order within each group
+        sys.path[:] = keep + tail
+
+
+def _chain_next_sitecustomize():
+    # `site` imports only the first sitecustomize on sys.path (this one). Run
+    # the next one down the path (e.g. the LCG view's) so its behaviour is
+    # preserved. Exec in a throwaway namespace to avoid import recursion.
+    try:
+        myself = _osp.realpath(__file__)
+    except Exception:
+        return
+    for d in sys.path:
+        try:
+            cand = _osp.realpath(_osp.join(d, "sitecustomize.py"))
+        except Exception:
+            continue
+        if cand == myself or not _osp.isfile(cand):
+            continue
+        try:
+            with open(cand) as fh:
+                code = compile(fh.read(), cand, "exec")
+            exec(code, {"__file__": cand, "__name__": "sitecustomize"})
+        except Exception:
+            pass
+        break
+
+
+_demote_lcg_paths()
+_chain_next_sitecustomize()
+PY
 
 # --- keep PYTHONHOME set for embedded interpreters (e.g. gdb) ---------------
 # Append a restore step to the end of the activation scripts that unset

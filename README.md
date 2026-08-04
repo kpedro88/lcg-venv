@@ -22,17 +22,27 @@ CPython places `PYTHONPATH` entries on `sys.path` **ahead** of a venv's own
 you `pip install` into the venv is shadowed by the LCG copy.
 
 To make local installs win, we control things *inside the interpreter*
-via a **`.pth` import hook** — no shell rewriting at all.
-`lcg-venv` drops two tiny files into the venv's `site-packages`:
+via **two cooperating hooks** in the venv's
+`site-packages`, split this way because of *when* Python's `site` module runs
+each kind of hook at startup (necessary for editable installs to work):
 
-* `_lcgvenv_pathfix.pth` — a single line: `import _lcgvenv_pathfix`
-* `_lcgvenv_pathfix.py` — at startup, detects it is inside a venv
-  (`sys.prefix != sys.base_prefix`) and moves the venv's `purelib`/`platlib` to
-  the front of `sys.path`, leaving every LCG entry in place.
+1. **`_lcgvenv_pathfix.pth`** (`import _lcgvenv_pathfix`) → runs early, during
+   `.pth` processing. It **promotes** the venv's `purelib`/`platlib` to the
+   front of `sys.path`. Its job is to make sure the venv's *own*
+   `sitecustomize.py` is the one `site` discovers (otherwise the LCG view's
+   `sitecustomize.py`, earlier on the path, shadows it). It uses
+   **`_lcgvenv_pathfix.py`** under the hood.
+2. **`sitecustomize.py`** → runs last, after *all* `.pth` files
+   (`site.main()` calls `execsitecustomize()` at the end). It does the
+   authoritative reordering: it **demotes every directory the LCG view put on
+   `PYTHONPATH`** to the tail of `sys.path`. Everything left in front — the
+   venv site-packages *and* any source dirs that editable installs appended —
+   keeps priority, while all LCG packages stay importable from the tail. It
+   also chains to the next `sitecustomize.py` on the path (the LCG view's) so
+   that behavior is preserved.
 
-The `site` module executes the `.pth` line at **every** interpreter startup,
-*after* `sys.path` has been built from `PYTHONPATH` — so it always gets the last
-word, no matter how Python was launched.
+Both act only inside a venv (`sys.prefix != sys.base_prefix`) and run at
+**every** interpreter startup, no matter how Python was launched.
 
 ### `PYTHONHOME` and embedded interpreters (e.g. `gdb`)
 
