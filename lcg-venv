@@ -84,17 +84,52 @@ fi
 #      early, so this ensures our own sitecustomize.py (below) is the one that
 #      gets imported, instead of the LCG view's shadowing it.
 #
-#   2. sitecustomize.py      -> DEMOTES every directory the LCG view injected
-#      via PYTHONPATH to the tail of sys.path. site.main() runs sitecustomize
-#      *after all* .pth files, so this reliably wins even against paths that
-#      .pth files append later -- most importantly `pip install -e` (editable
-#      installs), which drop a .pth that appends the project source dir. A
-#      .pth-only fix cannot catch those, because .pth files run in sorted order
-#      and an editable .pth may sort after ours. sitecustomize always runs last.
+#   2. sitecustomize.py      -> DEMOTES the LCG view directories to the tail of
+#      sys.path. site.main() runs sitecustomize *after all* .pth files, so this
+#      reliably wins even against paths that .pth files append later -- most
+#      importantly `pip install -e` (editable installs), which drop a .pth that
+#      appends the project source dir. A .pth-only fix cannot catch those,
+#      because .pth files run in sorted order and an editable .pth may sort
+#      after ours. sitecustomize always runs last.
 #
-# Because `site` imports only the first sitecustomize.py found on sys.path,
-# ours also chains to the next one (e.g. the LCG view's) so its behaviour is
-# preserved.
+# CRUCIAL: both hooks act ONLY on the *specific* LCG view directories, captured
+# into a snapshot file (_lcgvenv_lcg_paths.txt) at creation time. They must NOT
+# treat "whatever is on PYTHONPATH right now" as LCG. During a PEP 517 build
+# (`pip install -e .`, `python -m build`, ...) pip runs an isolated build
+# subprocess in which it sets PYTHONPATH to its OWN temporary build-env dir and
+# expects that dir first on sys.path. An earlier version of this fix reordered
+# based on the live PYTHONPATH and on unconditional venv promotion, which shoved
+# pip's build-env dir to the back -- so the build imported its backend (e.g.
+# hatchling) from the venv instead of the isolated env and died with a missing
+# transitive dep (e.g. "No module named 'pathspec'"). Snapshotting the real LCG
+# dirs makes both hooks no-op inside the build subprocess (the LCG view dirs are
+# not on its sys.path), leaving pip's isolation untouched.
+#
+# Because `site` imports only the first sitecustomize.py found on sys.path, ours
+# also chains to the next one (e.g. the LCG view's) so its behavior is kept.
+
+# Snapshot the LCG view directories (as currently on PYTHONPATH), resolved to
+# real paths. This is the definition of "LCG" that both hooks use.
+"$VENV_NAME/bin/python" - "$SITE_DIR/_lcgvenv_lcg_paths.txt" <<'PY'
+import os
+import os.path as osp
+import sys
+
+out = sys.argv[1]
+seen, paths = set(), []
+for d in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+    if not d:
+        continue
+    try:
+        rp = osp.realpath(d)
+    except Exception:
+        rp = d
+    if rp not in seen:
+        seen.add(rp)
+        paths.append(rp)
+with open(out, "w") as fh:
+    fh.write("\n".join(paths) + ("\n" if paths else ""))
+PY
 
 # Piece 1: the .pth promoter.
 cat > "$SITE_DIR/_lcgvenv_pathfix.py" <<'PY'
@@ -103,9 +138,25 @@ cat > "$SITE_DIR/_lcgvenv_pathfix.py" <<'PY'
 Runs early (imported from a .pth file) so that the venv's own sitecustomize.py
 is discovered by `site` ahead of the LCG view's. The authoritative reordering
 happens later in sitecustomize.py.
+
+Acts only when an LCG view directory (from the creation-time snapshot) is
+actually present on sys.path. That guard makes this a no-op inside pip's
+isolated build subprocess, where the LCG dirs are absent and pip's build-env
+dir must stay first.
 """
+import os.path as _osp
 import sys
 import sysconfig
+
+
+def _load_lcg_paths():
+    snap = _osp.join(_osp.dirname(_osp.realpath(__file__)),
+                     "_lcgvenv_lcg_paths.txt")
+    try:
+        with open(snap) as fh:
+            return {ln.strip() for ln in fh if ln.strip()}
+    except Exception:
+        return set()
 
 
 def _venv_site_dirs():
@@ -123,6 +174,13 @@ def _venv_site_dirs():
 def _promote():
     # Only act inside a venv (sys.prefix != sys.base_prefix).
     if getattr(sys, "prefix", None) == getattr(sys, "base_prefix", None):
+        return
+    lcg = _load_lcg_paths()
+    if not lcg:
+        return
+    # Do nothing unless an LCG view dir is actually on sys.path (i.e. not in a
+    # PEP 517 build subprocess).
+    if not any(_osp.realpath(p) in lcg for p in sys.path):
         return
     venv_dirs = [d for d in _venv_site_dirs() if d in sys.path]
     if not venv_dirs:
@@ -147,31 +205,36 @@ is essential: editable installs (`pip install -e`) drop a .pth that appends
 their source dir to sys.path, and .pth files run in sorted order, so a .pth
 hook cannot reliably reorder around them. A sitecustomize always runs last.
 
-Strategy: move every directory that the LCG view injected via PYTHONPATH to
-the *tail* of sys.path. Whatever remains ahead -- the venv site-packages and
-any editable/source dirs added by .pth files -- keeps priority, while all LCG
-packages stay importable from the tail.
+Strategy: move the LCG view directories -- exactly those captured at creation
+time in _lcgvenv_lcg_paths.txt -- to the *tail* of sys.path. Whatever remains
+ahead (the venv site-packages and any editable/source dirs added by .pth files)
+keeps priority, while all LCG packages stay importable from the tail.
+
+Using the creation-time snapshot rather than the live PYTHONPATH is deliberate:
+inside pip's isolated build subprocess PYTHONPATH points at pip's own build-env
+dir, which must NOT be demoted. Since the snapshot lists only real LCG dirs
+(absent from the build subprocess's sys.path), this hook no-ops there and leaves
+pip's build isolation intact.
 """
-import os
 import os.path as _osp
 import sys
+
+
+def _load_lcg_paths():
+    snap = _osp.join(_osp.dirname(_osp.realpath(__file__)),
+                     "_lcgvenv_lcg_paths.txt")
+    try:
+        with open(snap) as fh:
+            return {ln.strip() for ln in fh if ln.strip()}
+    except Exception:
+        return set()
 
 
 def _demote_lcg_paths():
     # Only act inside a venv.
     if getattr(sys, "prefix", None) == getattr(sys, "base_prefix", None):
         return
-    pythonpath = os.environ.get("PYTHONPATH", "")
-    if not pythonpath:
-        return
-    lcg = set()
-    for d in pythonpath.split(os.pathsep):
-        if not d:
-            continue
-        try:
-            lcg.add(_osp.realpath(d))
-        except Exception:
-            pass
+    lcg = _load_lcg_paths()
     if not lcg:
         return
     keep, tail = [], []
@@ -187,7 +250,7 @@ def _demote_lcg_paths():
 
 def _chain_next_sitecustomize():
     # `site` imports only the first sitecustomize on sys.path (this one). Run
-    # the next one down the path (e.g. the LCG view's) so its behaviour is
+    # the next one down the path (e.g. the LCG view's) so its behavior is
     # preserved. Exec in a throwaway namespace to avoid import recursion.
     try:
         myself = _osp.realpath(__file__)

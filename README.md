@@ -21,10 +21,12 @@ CPython places `PYTHONPATH` entries on `sys.path` **ahead** of a venv's own
 `site-packages`. So even with `python3 -m venv --system-site-packages`, anything
 you `pip install` into the venv is shadowed by the LCG copy.
 
-To make local installs win, we control things *inside the interpreter*
-via **two cooperating hooks** in the venv's
-`site-packages`, split this way because of *when* Python's `site` module runs
-each kind of hook at startup (necessary for editable installs to work):
+To make local installs win, we control things *inside the interpreter*.
+At creation time, `lcg-venv` first **snapshots the LCG view directories**
+(the dirs that the view puts on `PYTHONPATH`) into `_lcgvenv_lcg_paths.txt`, then
+drops **two cooperating hooks** into the venv's `site-packages`, split this way
+because of *when* Python's `site` module runs each kind of hook at startup
+(necessary for editable installs and build isolation to work):
 
 1. **`_lcgvenv_pathfix.pth`** (`import _lcgvenv_pathfix`) → runs early, during
    `.pth` processing. It **promotes** the venv's `purelib`/`platlib` to the
@@ -34,15 +36,16 @@ each kind of hook at startup (necessary for editable installs to work):
    **`_lcgvenv_pathfix.py`** under the hood.
 2. **`sitecustomize.py`** → runs last, after *all* `.pth` files
    (`site.main()` calls `execsitecustomize()` at the end). It does the
-   authoritative reordering: it **demotes every directory the LCG view put on
-   `PYTHONPATH`** to the tail of `sys.path`. Everything left in front — the
-   venv site-packages *and* any source dirs that editable installs appended —
-   keeps priority, while all LCG packages stay importable from the tail. It
-   also chains to the next `sitecustomize.py` on the path (the LCG view's) so
-   that behavior is preserved.
+   authoritative reordering: it **demotes the snapshotted LCG view directories**
+   to the tail of `sys.path`. Everything left in front — the venv site-packages
+   *and* any source dirs that editable installs appended — keeps priority, while
+   all LCG packages stay importable from the tail. It also chains to the next
+   `sitecustomize.py` on the path (the LCG view's) so that behavior is
+   preserved.
 
-Both act only inside a venv (`sys.prefix != sys.base_prefix`) and run at
-**every** interpreter startup, no matter how Python was launched.
+Both act only inside a venv (`sys.prefix != sys.base_prefix`), only touch the
+snapshotted LCG dirs, and run at **every** interpreter startup — no matter how
+Python was launched.
 
 ### `PYTHONHOME` and embedded interpreters (e.g. `gdb`)
 
@@ -62,6 +65,41 @@ points at the venv's own base interpreter, so it is safe for the venv python
 (which still reports the venv `sys.prefix` and still lets local packages win),
 and `deactivate` restores/round-trips it cleanly. `activate.csh` never touches
 `PYTHONHOME`, so it needs no change.
+
+### Editable installs (`pip install -e`)
+
+An editable install does **not** put the package in the venv's
+site-packages. It drops a `.pth` file (e.g. `_editable_impl_<pkg>.pth`,
+`__editable__.<pkg>-<ver>.pth`) whose content is a **bare directory path** —
+the project's source dir. `site` **appends** bare-path `.pth` entries to the
+end of `sys.path`. So the editable source lands *after* the LCG view's
+`site-packages`, and LCG wins.
+
+An early `.pth` hook that only *promotes the venv site-packages* can't fix
+this, because the editable source dir isn't in site-packages, and worse: `.pth`
+files are processed in **sorted filename order**, so an editable `.pth` that
+sorts *after* our hook is added to `sys.path` only *after* our hook has already
+run.
+
+The robust fix is the **`sitecustomize.py`** piece described above: `site` runs
+it *after every* `.pth` file, and it demotes the LCG view directories to the
+tail — so anything a `.pth` appended (editable sources included) ends up ahead
+of LCG regardless of `.pth` sort order.
+
+### Build isolation
+
+pip creates a temporary build environment, installs the
+build requirements into it (e.g. `hatchling` **and its deps**, e.g. `pathspec`),
+sets `PYTHONPATH` to *that* dir, and expects it **first** on `sys.path`.
+
+Therefore, both hooks must key off the *specific* LCG view directories, not
+"whatever is on `PYTHONPATH` now." `lcg-venv` snapshots the real LCG view dirs
+at creation time into `_lcgvenv_lcg_paths.txt`, and:
+
+* the promoter runs **only if** one of those snapshot dirs is actually on
+  `sys.path` (false inside the build subprocess → no-op);
+* the demoter moves **only** those snapshot dirs to the tail (pip's build-env
+  dir is not among them → untouched).
 
 ## Caveats
 
